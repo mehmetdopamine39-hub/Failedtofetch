@@ -6,12 +6,16 @@ import logging
 import asyncio
 import aiohttp
 import requests
+import cloudscraper
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, asdict
 from enum import Enum
 from collections import defaultdict
 from functools import wraps
+from bs4 import BeautifulSoup
+import execjs
+import js2py
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -20,8 +24,7 @@ import telegram.error
 
 # ======================== KONFIGÜRASYON ========================
 BOT_TOKEN = "8723649029:AAH_E81gQ1blNXvitDNYGsjrm08xinAfZm4"
-ADMIN_IDS = [8610336203]  # Sahip ID'si
-CHANNEL_ID = None  # Kanal ID yoksa None
+ADMIN_IDS = [8610336203]
 SUPPORT_USERNAME = "@rinexdestek"
 
 # Emoji listesi
@@ -49,6 +52,13 @@ EMOJIS = {
     "edit": "✏️",
     "refresh": "🔄",
     "menu": "📋",
+    "id": "🆔",
+    "phone": "📱",
+    "address": "🏠",
+    "car": "🚗",
+    "bank": "🏦",
+    "school": "🎓",
+    "social": "🌐",
 }
 
 # ======================== VERİ YAPILARI ========================
@@ -84,7 +94,8 @@ class ApiEndpoint:
     is_premium: bool = False
     is_active: bool = True
     bypass_js: bool = False
-    parser_type: str = "json"  # json, html, custom
+    parser_type: str = "json"
+    headers: Dict[str, str] = None
 
 @dataclass
 class Announcement:
@@ -114,27 +125,24 @@ class DataManager:
         self._load_data()
     
     def _load_data(self):
-        """Tüm verileri yükle"""
         self.users = self._load_json(self.users_file, {})
         self.queries = self._load_json(self.queries_file, [])
         self.apis = self._load_json(self.apis_file, {})
         self.announcements = self._load_json(self.announcements_file, [])
         self.settings = self._load_json(self.settings_file, {})
         
-        # Varsayılan ayarlar
         default_settings = {
             "maintenance_mode": False,
             "maintenance_message": "Bakım çalışması var, lütfen daha sonra tekrar deneyin.",
             "premium_price": 50,
-            "premium_duration": 30,  # gün
-            "free_search_limit": 5,  # günlük
+            "premium_duration": 30,
+            "free_search_limit": 5,
         }
         for key, value in default_settings.items():
             if key not in self.settings:
                 self.settings[key] = value
     
     def _load_json(self, file_path: str, default: Any):
-        """JSON dosyası yükle"""
         try:
             if os.path.exists(file_path):
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -144,7 +152,6 @@ class DataManager:
         return default
     
     def _save_json(self, file_path: str, data: Any):
-        """JSON dosyasına kaydet"""
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2, default=str)
@@ -152,14 +159,12 @@ class DataManager:
             logging.error(f"Veri kaydetme hatası {file_path}: {e}")
     
     def save_all(self):
-        """Tüm verileri kaydet"""
         self._save_json(self.users_file, self.users)
         self._save_json(self.queries_file, self.queries)
         self._save_json(self.apis_file, self.apis)
         self._save_json(self.announcements_file, self.announcements)
         self._save_json(self.settings_file, self.settings)
     
-    # Kullanıcı işlemleri
     def get_user(self, user_id: int) -> UserData:
         if user_id not in self.users:
             self.users[user_id] = UserData(user_id=user_id, joined_date=datetime.now())
@@ -170,7 +175,6 @@ class DataManager:
         self.users[user_data.user_id] = user_data
         self.save_all()
     
-    # Sorgu işlemleri
     def add_query(self, query: SearchQuery):
         self.queries.append(query)
         self.save_all()
@@ -178,7 +182,6 @@ class DataManager:
     def get_user_queries(self, user_id: int, limit: int = 10) -> List[SearchQuery]:
         return [q for q in self.queries if q.user_id == user_id][-limit:]
     
-    # API işlemleri
     def get_api(self, name: str) -> Optional[ApiEndpoint]:
         return self.apis.get(name)
     
@@ -191,7 +194,6 @@ class DataManager:
             del self.apis[name]
             self.save_all()
     
-    # Duyuru işlemleri
     def add_announcement(self, announcement: Announcement):
         self.announcements.append(announcement)
         self.save_all()
@@ -207,6 +209,14 @@ class DataManager:
 class ApiClient:
     def __init__(self):
         self.session = None
+        self.scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True,
+                'mobile': False
+            }
+        )
         self.user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -223,8 +233,7 @@ class ApiClient:
         if self.session:
             await self.session.close()
     
-    def _get_headers(self, bypass_js: bool = False) -> Dict[str, str]:
-        """İstek header'ları oluştur"""
+    def _get_headers(self, bypass_js: bool = False, custom_headers: Dict = None) -> Dict[str, str]:
         headers = {
             "User-Agent": self.user_agents[0],
             "Accept": "application/json, text/html, */*",
@@ -240,13 +249,68 @@ class ApiClient:
             headers["Sec-Fetch-Mode"] = "navigate"
             headers["Sec-Fetch-Site"] = "none"
             headers["Sec-Fetch-User"] = "?1"
-            
+        
+        if custom_headers:
+            headers.update(custom_headers)
+        
         return headers
     
-    async def get(self, url: str, params: Dict = None, bypass_js: bool = False) -> Any:
+    def _extract_json_from_html(self, html: str) -> Dict:
+        """HTML içinden JSON verilerini çıkar"""
+        try:
+            # JSON pattern'leri
+            patterns = [
+                r'<pre[^>]*>(.*?)</pre>',
+                r'<code[^>]*>(.*?)</code>',
+                r'({[^}]*})',
+                r'(\[[^\]]*\])',
+            ]
+            
+            for pattern in patterns:
+                matches = re.findall(pattern, html, re.DOTALL)
+                for match in matches:
+                    try:
+                        data = json.loads(match.strip())
+                        if data:
+                            return data
+                    except:
+                        continue
+            
+            # BeautifulSoup ile temizle
+            soup = BeautifulSoup(html, 'html.parser')
+            text = soup.get_text()
+            
+            # JSON bulmaya çalış
+            try:
+                json_match = re.search(r'({.*})', text)
+                if json_match:
+                    return json.loads(json_match.group(1))
+            except:
+                pass
+                
+            return {"raw": html[:1000]}
+            
+        except Exception as e:
+            logging.error(f"JSON çıkarma hatası: {e}")
+            return {"raw": html[:500]}
+    
+    async def get(self, url: str, params: Dict = None, bypass_js: bool = False, 
+                  custom_headers: Dict = None, use_cloudscraper: bool = False) -> Any:
         """HTTP GET isteği gönder"""
         try:
-            headers = self._get_headers(bypass_js)
+            # CloudScraper kullan
+            if use_cloudscraper or bypass_js:
+                try:
+                    response = self.scraper.get(url, params=params, timeout=30)
+                    try:
+                        return response.json()
+                    except:
+                        return self._extract_json_from_html(response.text)
+                except Exception as e:
+                    logging.warning(f"CloudScraper hatası, normal istek deneniyor: {e}")
+            
+            # Normal istek
+            headers = self._get_headers(bypass_js, custom_headers)
             timeout = aiohttp.ClientTimeout(total=30)
             
             async with self.session.get(url, params=params, headers=headers, timeout=timeout) as response:
@@ -256,19 +320,11 @@ class ApiClient:
                     return await response.json()
                 else:
                     text = await response.text()
-                    # JSON formatına çevirmeye çalış
-                    try:
-                        # HTML içinde gizli JSON verisi ara
-                        json_pattern = r'({[^}]*})'  # Basit JSON bulma
-                        matches = re.findall(json_pattern, text)
-                        for match in matches:
-                            try:
-                                return json.loads(match)
-                            except:
-                                continue
-                    except:
-                        pass
-                    return {"raw": text}
+                    # HTML içinden JSON çıkarmayı dene
+                    json_data = self._extract_json_from_html(text)
+                    if json_data and "raw" not in json_data:
+                        return json_data
+                    return {"raw": text[:500]}
                     
         except Exception as e:
             logging.error(f"API isteği hatası: {e}")
@@ -281,13 +337,12 @@ class SorguBot:
         self.data = data_manager
         self.api_client = ApiClient()
         self.application = None
-        
-        # Varsayılan API'leri yükle
         self._load_default_apis()
     
     def _load_default_apis(self):
-        """Varsayılan API'leri yükle"""
+        """Tüm API'leri yükle"""
         default_apis = {
+            # ===== ARAŞTIR.VIP API'leri =====
             "tc_sorgu": ApiEndpoint(
                 name="tc_sorgu",
                 url="https://arastir.vip/api/tc.php",
@@ -316,6 +371,29 @@ class SorguBot:
                 is_premium=True,
                 bypass_js=True
             ),
+            "tc_gsm_sorgu": ApiEndpoint(
+                name="tc_gsm_sorgu",
+                url="https://arastir.vip/api/tcgsm.php",
+                params={"tc": ""},
+                is_premium=True,
+                bypass_js=True
+            ),
+            "isyeri_sorgu": ApiEndpoint(
+                name="isyeri_sorgu",
+                url="https://arastir.vip/api/isyeri.php",
+                params={"tc": ""},
+                is_premium=True,
+                bypass_js=True
+            ),
+            "sulale_sorgu": ApiEndpoint(
+                name="sulale_sorgu",
+                url="https://arastir.vip/api/sulale.php",
+                params={"tc": ""},
+                is_premium=True,
+                bypass_js=True
+            ),
+            
+            # ===== ANYAPI.IO =====
             "iban_sorgu": ApiEndpoint(
                 name="iban_sorgu",
                 url="https://anyapi.io/api/v1/iban",
@@ -323,6 +401,8 @@ class SorguBot:
                 is_premium=True,
                 bypass_js=False
             ),
+            
+            # ===== SORGUPANELAPILERIM =====
             "eokul_sorgu": ApiEndpoint(
                 name="eokul_sorgu",
                 url="https://sorgupanelapilerim.freedev.app/index.php",
@@ -344,6 +424,8 @@ class SorguBot:
                 is_premium=False,
                 bypass_js=True
             ),
+            
+            # ===== RINEX INSTAGRAM =====
             "instagram_sorgu": ApiEndpoint(
                 name="instagram_sorgu",
                 url="https://rinexinstegramsorguapi.rf.gd/api/instagram.php",
@@ -351,6 +433,8 @@ class SorguBot:
                 is_premium=False,
                 bypass_js=True
             ),
+            
+            # ===== RINEX SECMEN =====
             "secmen_tc_sorgu": ApiEndpoint(
                 name="secmen_tc_sorgu",
                 url="https://rinexsecmensorguapu.gt.tc/api/secmen.php",
@@ -365,6 +449,17 @@ class SorguBot:
                 is_premium=True,
                 bypass_js=True
             ),
+            
+            # ===== RINEX PLAKA =====
+            "plaka_arama_sorgu": ApiEndpoint(
+                name="plaka_arama_sorgu",
+                url="https://rinexplakasorguapi.gt.tc/api/plaka.php",
+                params={"endpoint": "ara", "q": ""},
+                is_premium=False,
+                bypass_js=True
+            ),
+            
+            # ===== INIAL SORGU =====
             "innial_gsm_sorgu": ApiEndpoint(
                 name="innial_gsm_sorgu",
                 url="https://inialsorguapi.onrender.com/api/innial.php",
@@ -379,6 +474,8 @@ class SorguBot:
                 is_premium=True,
                 bypass_js=False
             ),
+            
+            # ===== SGK =====
             "sgk_tc_sorgu": ApiEndpoint(
                 name="sgk_tc_sorgu",
                 url="https://eokulsorguapi.onrender.com/sgk/api",
@@ -393,6 +490,15 @@ class SorguBot:
                 is_premium=True,
                 bypass_js=False
             ),
+            
+            # ===== EOKUL =====
+            "eokul_tc_sorgu": ApiEndpoint(
+                name="eokul_tc_sorgu",
+                url="https://lorexchecksorguapi.onrender.com/eokul/api",
+                params={"tc": ""},
+                is_premium=True,
+                bypass_js=False
+            ),
         }
         
         for name, api in default_apis.items():
@@ -400,24 +506,15 @@ class SorguBot:
                 self.data.add_api(api)
     
     async def initialize(self):
-        """Botu başlat"""
         self.application = Application.builder().token(self.token).build()
         
-        # Komutlar
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("admin", self.admin_command))
-        
-        # Callback handler
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
-        
-        # Mesaj handler
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-        
-        # Hata handler
         self.application.add_error_handler(self.error_handler)
     
     async def check_user(self, update: Update) -> Tuple[Optional[UserData], bool]:
-        """Kullanıcı kontrolü ve veritabanına ekleme"""
         user = update.effective_user
         user_data = self.data.get_user(user.id)
         user_data.username = user.username or ""
@@ -425,11 +522,9 @@ class SorguBot:
         user_data.last_name = user.last_name or ""
         self.data.save_user(user_data)
         
-        # Ban kontrolü
         if user_data.is_banned:
             return user_data, False
         
-        # Bakım modu kontrolü
         if self.data.settings.get("maintenance_mode", False):
             if user.id not in ADMIN_IDS:
                 await update.effective_message.reply_text(
@@ -440,7 +535,6 @@ class SorguBot:
         return user_data, True
     
     def create_main_menu(self, user_data: UserData) -> InlineKeyboardMarkup:
-        """Ana menü oluştur"""
         keyboard = [
             [InlineKeyboardButton(f"{EMOJIS['search']} Sorgu Başlat", callback_data="menu_search")],
             [InlineKeyboardButton(f"{EMOJIS['premium']} Premium Bilgilerim", callback_data="menu_premium")],
@@ -454,20 +548,19 @@ class SorguBot:
         return InlineKeyboardMarkup(keyboard)
     
     def create_search_menu(self, user_data: UserData) -> InlineKeyboardMarkup:
-        """Sorgu menüsü oluştur"""
         keyboard = []
         
         # Free sorgular
         free_apis = [api for api in self.data.apis.values() if not api.is_premium and api.is_active]
-        for api in free_apis[:5]:
-            keyboard.append([InlineKeyboardButton(f"{EMOJIS['free']} {api.name.replace('_', ' ').title()}", 
-                                                 callback_data=f"search_{api.name}")])
+        for api in free_apis:
+            label = f"{EMOJIS['free']} {api.name.replace('_', ' ').title()}"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"search_{api.name}")])
         
         # Premium sorgular
         premium_apis = [api for api in self.data.apis.values() if api.is_premium and api.is_active]
         if premium_apis:
             keyboard.append([InlineKeyboardButton("─── Premium Sorgular ───", callback_data="dummy")])
-            for api in premium_apis[:5]:
+            for api in premium_apis:
                 label = f"{EMOJIS['premium']} {api.name.replace('_', ' ').title()}"
                 if user_data.is_premium:
                     callback = f"search_{api.name}"
@@ -479,18 +572,16 @@ class SorguBot:
         return InlineKeyboardMarkup(keyboard)
     
     async def format_result(self, data: Any, query_type: str) -> str:
-        """Sorgu sonucunu formatla"""
         if isinstance(data, dict):
             if "error" in data:
                 return f"{EMOJIS['error']} Hata: {data['error']}"
             
             result_parts = [f"{EMOJIS['success']} Sorgu Sonucu:"]
             for key, value in data.items():
-                if value and key not in ["raw", "error"]:
+                if value and key not in ["raw", "error", "apiKey"]:
                     result_parts.append(f"🔹 {key.replace('_', ' ').title()}: {value}")
             
             if len(result_parts) == 1:
-                # Veri bulunamadıysa
                 return f"{EMOJIS['warning']} Veri bulunamadı veya hatalı format."
             
             return "\n".join(result_parts)
@@ -509,7 +600,6 @@ class SorguBot:
     
     # ======================== KOMUTLAR ========================
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """/start komutu"""
         user_data, ok = await self.check_user(update)
         if not ok:
             return
@@ -530,7 +620,6 @@ class SorguBot:
         )
     
     async def admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """/admin komutu"""
         user = update.effective_user
         if user.id not in ADMIN_IDS:
             await update.message.reply_text(f"{EMOJIS['error']} Bu komut sadece adminler içindir!")
@@ -539,7 +628,6 @@ class SorguBot:
         await self.show_admin_menu(update, context)
     
     async def show_admin_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Admin menüsünü göster"""
         keyboard = [
             [InlineKeyboardButton(f"{EMOJIS['database']} Sorgu Yönetimi", callback_data="admin_queries")],
             [InlineKeyboardButton(f"{EMOJIS['user']} Kullanıcı Yönetimi", callback_data="admin_users")],
@@ -566,7 +654,6 @@ class SorguBot:
     
     # ======================== CALLBACK HANDLER ========================
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Callback query handler"""
         query = update.callback_query
         await query.answer()
         
@@ -576,7 +663,6 @@ class SorguBot:
         
         data = query.data
         
-        # Ana menü
         if data == "main_menu":
             await query.edit_message_text(
                 f"{EMOJIS['user']} *Ana Menü*\n\nHoş geldiniz {update.effective_user.first_name}!",
@@ -584,7 +670,6 @@ class SorguBot:
                 parse_mode=ParseMode.MARKDOWN
             )
         
-        # Sorgu menüsü
         elif data == "menu_search":
             await query.edit_message_text(
                 f"{EMOJIS['search']} *Sorgu Menüsü*\n\nAşağıdan sorgu tipini seçin:",
@@ -592,7 +677,6 @@ class SorguBot:
                 parse_mode=ParseMode.MARKDOWN
             )
         
-        # Premium bilgiler
         elif data == "menu_premium":
             if user_data.is_premium:
                 expiry = user_data.premium_expiry.strftime("%d.%m.%Y %H:%M") if user_data.premium_expiry else "Süresiz"
@@ -618,7 +702,6 @@ class SorguBot:
                 parse_mode=ParseMode.MARKDOWN
             )
         
-        # Sorgu geçmişi
         elif data == "menu_history":
             history = self.data.get_user_queries(user_data.user_id, 10)
             if history:
@@ -635,7 +718,6 @@ class SorguBot:
                 parse_mode=ParseMode.MARKDOWN
             )
         
-        # Yardım
         elif data == "menu_help":
             text = (
                 f"{EMOJIS['info']} *Yardım & Destek*\n\n"
@@ -654,7 +736,6 @@ class SorguBot:
                 parse_mode=ParseMode.MARKDOWN
             )
         
-        # Admin menüsü
         elif data == "menu_admin":
             if update.effective_user.id in ADMIN_IDS:
                 await self.show_admin_menu(update, context)
@@ -664,7 +745,6 @@ class SorguBot:
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{EMOJIS['menu']} Ana Menü", callback_data="main_menu")]])
                 )
         
-        # Sorgu başlatma
         elif data.startswith("search_"):
             api_name = data.replace("search_", "")
             api = self.data.get_api(api_name)
@@ -675,7 +755,6 @@ class SorguBot:
                 )
                 return
             
-            # Premium kontrolü
             if api.is_premium and not user_data.is_premium:
                 await query.edit_message_text(
                     f"{EMOJIS['premium']} Bu sorgu premium özelliktir!\n\n"
@@ -684,19 +763,22 @@ class SorguBot:
                 )
                 return
             
-            # Sorgu bilgisi iste
             context.user_data['search_api'] = api_name
+            param_examples = []
+            for key, value in api.params.items():
+                if value:
+                    param_examples.append(value)
+            
             await query.edit_message_text(
                 f"{EMOJIS['search']} *{api.name.replace('_', ' ').title()} Sorgusu*\n\n"
                 f"Lütfen sorgu değerini girin:\n"
-                f"Örnek: {', '.join([v for v in api.params.values() if v])}",
+                f"Örnek: {', '.join(param_examples) if param_examples else 'Değer'}",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(f"{EMOJIS['menu']} Vazgeç", callback_data="main_menu")]
                 ]),
                 parse_mode=ParseMode.MARKDOWN
             )
         
-        # Premium gerekli
         elif data == "premium_required":
             await query.edit_message_text(
                 f"{EMOJIS['premium']} Bu özellik premium üyelik gerektirir!\n\n"
@@ -707,7 +789,7 @@ class SorguBot:
                 ])
             )
         
-        # Admin işlemleri
+        # Admin işlemleri (kısaltılmış)
         elif data.startswith("admin_"):
             if update.effective_user.id not in ADMIN_IDS:
                 await query.edit_message_text(f"{EMOJIS['error']} Bu alana erişim yetkiniz yok!")
@@ -728,12 +810,10 @@ class SorguBot:
     
     # ======================== ADMIN MENULERİ ========================
     async def admin_queries_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Sorgu yönetim menüsü"""
         keyboard = [
             [InlineKeyboardButton(f"{EMOJIS['new']} Yeni Sorgu Ekle", callback_data="admin_add_query")],
             [InlineKeyboardButton(f"{EMOJIS['delete']} Sorgu Sil", callback_data="admin_del_query")],
-            [InlineKeyboardButton(f"{EMOJIS['edit']} Sorgu Düzenle", callback_data="admin_edit_query")],
-            [InlineKeyboardButton(f"{EMOJIS['link']} Sorgu Listesi", callback_data="admin_list_queries")],
+            [InlineKeyboardButton(f"{EMOJIS['list']} Sorgu Listesi", callback_data="admin_list_queries")],
             [InlineKeyboardButton(f"{EMOJIS['menu']} Geri", callback_data="menu_admin")],
         ]
         
@@ -745,7 +825,6 @@ class SorguBot:
         )
     
     async def admin_users_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Kullanıcı yönetim menüsü"""
         keyboard = [
             [InlineKeyboardButton(f"{EMOJIS['user']} Kullanıcı Listesi", callback_data="admin_user_list")],
             [InlineKeyboardButton(f"{EMOJIS['lock']} Kullanıcı Banla", callback_data="admin_ban_user")],
@@ -763,7 +842,6 @@ class SorguBot:
         )
     
     async def admin_premium_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Premium yönetim menüsü"""
         keyboard = [
             [InlineKeyboardButton(f"{EMOJIS['premium']} Premium Fiyat Ayarla", callback_data="admin_set_price")],
             [InlineKeyboardButton(f"{EMOJIS['money']} Premium Süre Ayarla", callback_data="admin_set_duration")],
@@ -780,7 +858,6 @@ class SorguBot:
         )
     
     async def admin_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Ayarlar menüsü"""
         settings = self.data.settings
         text = (
             f"{EMOJIS['settings']} *Ayarlar*\n\n"
@@ -803,7 +880,6 @@ class SorguBot:
         )
     
     async def admin_announce_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Duyuru menüsü"""
         keyboard = [
             [InlineKeyboardButton(f"{EMOJIS['new']} Duyuru Ekle", callback_data="admin_add_announce")],
             [InlineKeyboardButton(f"{EMOJIS['delete']} Duyuru Sil", callback_data="admin_del_announce")],
@@ -819,7 +895,6 @@ class SorguBot:
         )
     
     async def admin_maintenance_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Bakım modu menüsü"""
         mode = self.data.settings.get("maintenance_mode", False)
         text = (
             f"{EMOJIS['warning_icon']} *Bakım Modu*\n\n"
@@ -845,7 +920,6 @@ class SorguBot:
     
     # ======================== MESAJ HANDLER ========================
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Kullanıcı mesajlarını işle"""
         user_data, ok = await self.check_user(update)
         if not ok:
             return
@@ -853,7 +927,6 @@ class SorguBot:
         message = update.message.text
         user_id = update.effective_user.id
         
-        # Sorgu beklemesi
         if 'search_api' in context.user_data:
             api_name = context.user_data.pop('search_api')
             api = self.data.get_api(api_name)
@@ -862,25 +935,35 @@ class SorguBot:
                 await update.message.reply_text(f"{EMOJIS['error']} Sorgu türü bulunamadı!")
                 return
             
-            # API isteği gönder
             await update.message.reply_text(f"{EMOJIS['loading']} Sorgu yapılıyor, lütfen bekleyin...")
             
-            # Parametreleri hazırla
             params = {}
-            for key, value in api.params.items():
-                if value:  # Boş değilse
-                    params[key] = message
-                else:
-                    params[key] = ""  # Boş bırakılan parametreler
+            param_keys = list(api.params.keys())
+            
+            # Parametreleri hazırla
+            if len(param_keys) == 1:
+                # Tek parametreli sorgu
+                params[param_keys[0]] = message
+            else:
+                # Çok parametreli sorgu - boşlukla ayrılmış değerler
+                values = message.split()
+                for i, key in enumerate(param_keys):
+                    if i < len(values):
+                        params[key] = values[i]
+                    else:
+                        params[key] = ""
             
             # API isteği yap
             async with ApiClient() as client:
-                result = await client.get(api.url, params=params, bypass_js=api.bypass_js)
+                result = await client.get(
+                    api.url, 
+                    params=params, 
+                    bypass_js=api.bypass_js,
+                    use_cloudscraper=api.bypass_js
+                )
             
-            # Sonucu formatla
             formatted_result = await self.format_result(result, api_name)
             
-            # Sorguyu kaydet
             query = SearchQuery(
                 query_id=str(time.time()),
                 user_id=user_id,
@@ -892,22 +975,18 @@ class SorguBot:
             )
             self.data.add_query(query)
             
-            # Kullanıcı sorgu sayısını güncelle
             user_data.search_count += 1
             user_data.last_search = datetime.now()
             self.data.save_user(user_data)
             
-            # Sonucu gönder
             await update.message.reply_text(
                 f"{formatted_result}\n\n{EMOJIS['menu']} Ana menü için /start yazın."
             )
             
-            # Spam kontrolü
             if user_data.search_count > self.data.settings.get('free_search_limit', 5) and not user_data.is_premium:
                 await update.message.reply_text(
                     f"{EMOJIS['warning']} Günlük ücretsiz sorgu limitini aştınız! Premium almak için /admin yazın."
                 )
-                # Admin'e bildirim
                 for admin_id in ADMIN_IDS:
                     try:
                         await self.application.bot.send_message(
@@ -919,16 +998,13 @@ class SorguBot:
                         )
                     except:
                         pass
-
         else:
-            # Bilinmeyen mesaj
             await update.message.reply_text(
                 f"{EMOJIS['info']} Anlamadım. Lütfen butonları kullanın veya /start yazın."
             )
     
     # ======================== HATA YÖNETİMİ ========================
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Hata yönetimi"""
         logging.error(f"Bot hatası: {context.error}")
         
         try:
@@ -939,7 +1015,6 @@ class SorguBot:
         except:
             pass
         
-        # Admin'e hata bildirimi
         for admin_id in ADMIN_IDS:
             try:
                 await self.application.bot.send_message(
@@ -951,7 +1026,6 @@ class SorguBot:
     
     # ======================== BOT BAŞLATMA ========================
     def run(self):
-        """Botu çalıştır"""
         if not self.application:
             asyncio.run(self.initialize())
         
@@ -960,13 +1034,11 @@ class SorguBot:
 
 # ======================== ANA PROGRAM ========================
 if __name__ == "__main__":
-    # Logging ayarları
     logging.basicConfig(
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         level=logging.INFO
     )
     
-    # Bot'u başlat
     data_manager = DataManager()
     bot = SorguBot(BOT_TOKEN, data_manager)
     bot.run()
