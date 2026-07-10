@@ -9,15 +9,13 @@ import requests
 import cloudscraper
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass, asdict
-from enum import Enum
+from dataclasses import dataclass, field
 from collections import defaultdict
 from functools import wraps
 from bs4 import BeautifulSoup
-import execjs
-import js2py
+import html5lib
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 import telegram.error
@@ -69,12 +67,12 @@ class UserData:
     first_name: str = ""
     last_name: str = ""
     is_premium: bool = False
-    premium_expiry: Optional[datetime] = None
+    premium_expiry: Optional[str] = None
     search_count: int = 0
-    last_search: Optional[datetime] = None
+    last_search: Optional[str] = None
     is_banned: bool = False
     warning_count: int = 0
-    joined_date: datetime = None
+    joined_date: str = field(default_factory=lambda: datetime.now().isoformat())
 
 @dataclass
 class SearchQuery:
@@ -83,7 +81,7 @@ class SearchQuery:
     query_type: str
     query_value: str
     result: Any = None
-    timestamp: datetime = None
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
     is_premium_query: bool = False
 
 @dataclass
@@ -94,15 +92,13 @@ class ApiEndpoint:
     is_premium: bool = False
     is_active: bool = True
     bypass_js: bool = False
-    parser_type: str = "json"
-    headers: Dict[str, str] = None
 
 @dataclass
 class Announcement:
     id: str
     title: str
     content: str
-    date: datetime
+    date: str = field(default_factory=lambda: datetime.now().isoformat())
     is_active: bool = True
 
 # ======================== VERİ YÖNETİCİSİ ========================
@@ -154,7 +150,7 @@ class DataManager:
     def _save_json(self, file_path: str, data: Any):
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+                json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logging.error(f"Veri kaydetme hatası {file_path}: {e}")
     
@@ -167,7 +163,7 @@ class DataManager:
     
     def get_user(self, user_id: int) -> UserData:
         if user_id not in self.users:
-            self.users[user_id] = UserData(user_id=user_id, joined_date=datetime.now())
+            self.users[user_id] = UserData(user_id=user_id)
             self.save_all()
         return self.users[user_id]
     
@@ -233,7 +229,7 @@ class ApiClient:
         if self.session:
             await self.session.close()
     
-    def _get_headers(self, bypass_js: bool = False, custom_headers: Dict = None) -> Dict[str, str]:
+    def _get_headers(self, bypass_js: bool = False) -> Dict[str, str]:
         headers = {
             "User-Agent": self.user_agents[0],
             "Accept": "application/json, text/html, */*",
@@ -250,23 +246,21 @@ class ApiClient:
             headers["Sec-Fetch-Site"] = "none"
             headers["Sec-Fetch-User"] = "?1"
         
-        if custom_headers:
-            headers.update(custom_headers)
-        
         return headers
     
     def _extract_json_from_html(self, html: str) -> Dict:
-        """HTML içinden JSON verilerini çıkar"""
         try:
-            # JSON pattern'leri
-            patterns = [
+            soup = BeautifulSoup(html, 'html.parser')
+            text = soup.get_text()
+            
+            json_patterns = [
                 r'<pre[^>]*>(.*?)</pre>',
                 r'<code[^>]*>(.*?)</code>',
-                r'({[^}]*})',
-                r'(\[[^\]]*\])',
+                r'({[^{}]*})',
+                r'(\[[^\[\]]*\])',
             ]
             
-            for pattern in patterns:
+            for pattern in json_patterns:
                 matches = re.findall(pattern, html, re.DOTALL)
                 for match in matches:
                     try:
@@ -276,30 +270,29 @@ class ApiClient:
                     except:
                         continue
             
-            # BeautifulSoup ile temizle
-            soup = BeautifulSoup(html, 'html.parser')
-            text = soup.get_text()
-            
-            # JSON bulmaya çalış
             try:
                 json_match = re.search(r'({.*})', text)
                 if json_match:
                     return json.loads(json_match.group(1))
             except:
                 pass
+            
+            try:
+                array_match = re.search(r'(\[.*\])', text)
+                if array_match:
+                    return json.loads(array_match.group(1))
+            except:
+                pass
                 
-            return {"raw": html[:1000]}
+            return {"raw": text[:500]}
             
         except Exception as e:
             logging.error(f"JSON çıkarma hatası: {e}")
             return {"raw": html[:500]}
     
-    async def get(self, url: str, params: Dict = None, bypass_js: bool = False, 
-                  custom_headers: Dict = None, use_cloudscraper: bool = False) -> Any:
-        """HTTP GET isteği gönder"""
+    async def get(self, url: str, params: Dict = None, bypass_js: bool = False) -> Any:
         try:
-            # CloudScraper kullan
-            if use_cloudscraper or bypass_js:
+            if bypass_js:
                 try:
                     response = self.scraper.get(url, params=params, timeout=30)
                     try:
@@ -307,10 +300,9 @@ class ApiClient:
                     except:
                         return self._extract_json_from_html(response.text)
                 except Exception as e:
-                    logging.warning(f"CloudScraper hatası, normal istek deneniyor: {e}")
+                    logging.warning(f"CloudScraper hatası: {e}")
             
-            # Normal istek
-            headers = self._get_headers(bypass_js, custom_headers)
+            headers = self._get_headers(bypass_js)
             timeout = aiohttp.ClientTimeout(total=30)
             
             async with self.session.get(url, params=params, headers=headers, timeout=timeout) as response:
@@ -320,7 +312,6 @@ class ApiClient:
                     return await response.json()
                 else:
                     text = await response.text()
-                    # HTML içinden JSON çıkarmayı dene
                     json_data = self._extract_json_from_html(text)
                     if json_data and "raw" not in json_data:
                         return json_data
@@ -499,6 +490,33 @@ class SorguBot:
                 is_premium=True,
                 bypass_js=False
             ),
+            
+            # ===== TELEFON REHBERİ =====
+            "telefon_rehberi": ApiEndpoint(
+                name="telefon_rehberi",
+                url="https://arastir.vip/api/gsmtc.php",
+                params={"gsm": ""},
+                is_premium=True,
+                bypass_js=True
+            ),
+            
+            # ===== ADRES SORGU =====
+            "adres_detay": ApiEndpoint(
+                name="adres_detay",
+                url="https://arastir.vip/api/adres.php",
+                params={"tc": ""},
+                is_premium=True,
+                bypass_js=True
+            ),
+            
+            # ===== NÜFUS SORGU =====
+            "nufus_sorgu": ApiEndpoint(
+                name="nufus_sorgu",
+                url="https://arastir.vip/api/tc.php",
+                params={"tc": ""},
+                is_premium=False,
+                bypass_js=True
+            ),
         }
         
         for name, api in default_apis.items():
@@ -523,6 +541,9 @@ class SorguBot:
         self.data.save_user(user_data)
         
         if user_data.is_banned:
+            await update.effective_message.reply_text(
+                f"{EMOJIS['error']} Hesabınız yasaklanmıştır!"
+            )
             return user_data, False
         
         if self.data.settings.get("maintenance_mode", False):
@@ -550,13 +571,11 @@ class SorguBot:
     def create_search_menu(self, user_data: UserData) -> InlineKeyboardMarkup:
         keyboard = []
         
-        # Free sorgular
         free_apis = [api for api in self.data.apis.values() if not api.is_premium and api.is_active]
         for api in free_apis:
             label = f"{EMOJIS['free']} {api.name.replace('_', ' ').title()}"
             keyboard.append([InlineKeyboardButton(label, callback_data=f"search_{api.name}")])
         
-        # Premium sorgular
         premium_apis = [api for api in self.data.apis.values() if api.is_premium and api.is_active]
         if premium_apis:
             keyboard.append([InlineKeyboardButton("─── Premium Sorgular ───", callback_data="dummy")])
@@ -590,9 +609,10 @@ class SorguBot:
             for item in data[:10]:
                 if isinstance(item, dict):
                     for key, value in list(item.items())[:5]:
-                        result_parts.append(f"🔹 {key}: {value}")
+                        if value:
+                            result_parts.append(f"🔹 {key}: {value}")
                     result_parts.append("---")
-            return "\n".join(result_parts[:30])
+            return "\n".join(result_parts[:30]) if result_parts else f"{EMOJIS['warning']} Veri bulunamadı."
         elif isinstance(data, str):
             return f"{EMOJIS['success']} {data[:500]}"
         else:
@@ -679,7 +699,7 @@ class SorguBot:
         
         elif data == "menu_premium":
             if user_data.is_premium:
-                expiry = user_data.premium_expiry.strftime("%d.%m.%Y %H:%M") if user_data.premium_expiry else "Süresiz"
+                expiry = user_data.premium_expiry or "Süresiz"
                 text = (
                     f"{EMOJIS['premium']} *Premium Bilgileriniz*\n\n"
                     f"Durum: ✅ Aktif\n"
@@ -764,10 +784,7 @@ class SorguBot:
                 return
             
             context.user_data['search_api'] = api_name
-            param_examples = []
-            for key, value in api.params.items():
-                if value:
-                    param_examples.append(value)
+            param_examples = [v for v in api.params.values() if v]
             
             await query.edit_message_text(
                 f"{EMOJIS['search']} *{api.name.replace('_', ' ').title()} Sorgusu*\n\n"
@@ -789,7 +806,6 @@ class SorguBot:
                 ])
             )
         
-        # Admin işlemleri (kısaltılmış)
         elif data.startswith("admin_"):
             if update.effective_user.id not in ADMIN_IDS:
                 await query.edit_message_text(f"{EMOJIS['error']} Bu alana erişim yetkiniz yok!")
@@ -940,12 +956,9 @@ class SorguBot:
             params = {}
             param_keys = list(api.params.keys())
             
-            # Parametreleri hazırla
             if len(param_keys) == 1:
-                # Tek parametreli sorgu
                 params[param_keys[0]] = message
             else:
-                # Çok parametreli sorgu - boşlukla ayrılmış değerler
                 values = message.split()
                 for i, key in enumerate(param_keys):
                     if i < len(values):
@@ -953,14 +966,8 @@ class SorguBot:
                     else:
                         params[key] = ""
             
-            # API isteği yap
             async with ApiClient() as client:
-                result = await client.get(
-                    api.url, 
-                    params=params, 
-                    bypass_js=api.bypass_js,
-                    use_cloudscraper=api.bypass_js
-                )
+                result = await client.get(api.url, params=params, bypass_js=api.bypass_js)
             
             formatted_result = await self.format_result(result, api_name)
             
@@ -969,14 +976,12 @@ class SorguBot:
                 user_id=user_id,
                 query_type=api_name,
                 query_value=message,
-                result=result,
-                timestamp=datetime.now(),
-                is_premium_query=api.is_premium
+                result=result
             )
             self.data.add_query(query)
             
             user_data.search_count += 1
-            user_data.last_search = datetime.now()
+            user_data.last_search = datetime.now().isoformat()
             self.data.save_user(user_data)
             
             await update.message.reply_text(
