@@ -1,0 +1,17 @@
+python-telegram-bot==20.7
+aiohttp==3.9.1
+aiosqlite==0.19.0
+beautifulsoup4==4.12.2
+selenium==4.16.0
+webdriver-manager==4.0.1
+requests==2.31.0
+lxml==4.9.3
+cssselect==1.2.0
+pyppeteer==1.0.2
+playwright==1.40.0
+cloudscraper==1.2.71
+requests-html==0.10.0
+pyexecjs==1.5.1
+js2py==0.74
+dukpy==0.3.0
+pyv8==1.0.3
