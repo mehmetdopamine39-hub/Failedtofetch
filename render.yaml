@@ -5,35 +5,8 @@ services:
     plan: free
     region: frankfurt
     buildCommand: |
-      apt-get update && apt-get install -y \
-        wget \
-        gnupg \
-        unzip \
-        xvfb \
-        libxi6 \
-        libgconf-2-4 \
-        libx11-xcb1 \
-        libxcb1 \
-        libxcomposite1 \
-        libxcursor1 \
-        libxdamage1 \
-        libxi6 \
-        libxtst6 \
-        libnss3 \
-        libxrandr2 \
-        libasound2 \
-        libatk-bridge2.0-0 \
-        libgtk-3-0 \
-        libgbm1 \
-        libxshmfence1 \
-        fonts-liberation \
-        libappindicator1 \
-        libxkbcommon0 \
-        libcups2 \
-        libdrm2
+      pip install --upgrade pip
       pip install -r requirements.txt
-      playwright install chromium
-      playwright install-deps
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
@@ -42,8 +15,4 @@ services:
         value: 3.11.0
       - key: TZ
         value: Europe/Istanbul
-      - key: DISPLAY
-        value: :99
-      - key: CHROME_BIN
-        value: /usr/bin/google-chrome
     autoDeploy: true
