@@ -3,8 +3,11 @@ aiohttp==3.9.1
 aiosqlite==0.19.0
 beautifulsoup4==4.12.2
 requests==2.31.0
-lxml==4.9.3
 cloudscraper==1.2.71
 requests-html==0.10.0
 pyexecjs==1.5.1
 js2py==0.74
+html5lib==1.1
+charset-normalizer==3.3.2
+urllib3==2.1.0
+certifi==2023.11.17
